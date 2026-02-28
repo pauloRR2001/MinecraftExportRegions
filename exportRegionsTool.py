@@ -1,15 +1,18 @@
 """
-Minecraft region mover (Java 1.21.x): copy a 5x5 region square from SOURCE overworld
-(rx=-2..2, rz=-2..2) into TARGET overworld, shifted by +5120 blocks in X and Z.
+Minecraft region mover (Java 1.21.x): copy a 5x5 region square from SOURCE to TARGET.
 
 - Does NOT modify SOURCE.
 - Writes new/overwritten region/entity/poi files into TARGET.
 - Shifts:
-  - chunk xPos/zPos (by +320 chunks)
-  - block_entities x/z (by +5120 blocks)
-  - block_ticks/fluid_ticks x/z (by +5120 blocks)
-  - entities Pos (by +5120 blocks) + some common coordinate fields
-  - POI packed block-pos longs under keys like "pos" when present (best-effort)
+    - chunk xPos/zPos
+    - block_entities x/z
+    - block_ticks/fluid_ticks x/z
+    - entities Pos + some common coordinate fields
+    - POI packed block-pos longs under keys like "pos" when present (best-effort)
+
+Shift is defined in Overworld blocks.
+If MOVE_NETHER is enabled, we apply dx_nether = dx_overworld // 8 and dz_nether = dz_overworld // 8
+so existing portal pairs still correspond (1 Nether block <-> 8 Overworld blocks in X/Z).
 
 Run with Python 3.10+ on Windows.
 """
@@ -17,7 +20,6 @@ Run with Python 3.10+ on Windows.
 from __future__ import annotations
 
 import io
-import os
 import struct
 import time
 import zlib
@@ -35,16 +37,28 @@ import nbtlib
 SOURCE_WORLD = Path(r"C:\Users\paulo\AppData\Roaming\ATLauncher\instances\Minecraft12111withFabric\saves\Neith")
 TARGET_WORLD = Path(r"C:\Users\paulo\source\servers\server3\world")
 
+# Which dimensions to process: "overworld", "nether", or "both"
+DIMENSION_MODE = "nether"
+_valid_modes = {"overworld", "nether", "both"}
+if DIMENSION_MODE not in _valid_modes:
+    raise ValueError(f"DIMENSION_MODE must be one of {_valid_modes}, got {DIMENSION_MODE!r}")
+
+MOVE_OVERWORLD = DIMENSION_MODE in ("overworld", "both")
+MOVE_NETHER = DIMENSION_MODE in ("nether", "both")  # if True, apply scaled shift so portals match
+# MOVE_END = False  # optional future
+
+# Region window (in region coords)
 RX_MIN, RX_MAX = -2, 2
 RZ_MIN, RZ_MAX = -2, 2
 
+# Shift defined in OVERWORLD blocks
 DX_BLOCKS = 5120
 DZ_BLOCKS = 5120
 
 COPY_ENTITIES = True
-COPY_POI = False
+COPY_POI = False  # you said you don't care; keep as option
 
-OVERWRITE_TARGET = False  # set True if you want to overwrite existing target files
+OVERWRITE_TARGET = True  # set True if you want to overwrite existing target files
 
 
 # =========================
@@ -53,18 +67,44 @@ OVERWRITE_TARGET = False  # set True if you want to overwrite existing target fi
 SECTOR_BYTES = 4096
 HEADER_BYTES = 8192
 
-if DX_BLOCKS % 16 != 0 or DZ_BLOCKS % 16 != 0:
-    raise ValueError("DX_BLOCKS and DZ_BLOCKS must be multiples of 16 (chunk-aligned).")
+# Must be chunk-aligned in overworld
+assert DX_BLOCKS % 16 == 0 and DZ_BLOCKS % 16 == 0
 
+# For portal-consistent Nether move, overworld shift must be divisible by 8
+if MOVE_NETHER:
+    assert DX_BLOCKS % 8 == 0 and DZ_BLOCKS % 8 == 0, \
+        "Overworld DX/DZ must be divisible by 8 to preserve portal mapping."
+
+# Optional but recommended
 if DX_BLOCKS % 512 != 0 or DZ_BLOCKS % 512 != 0:
-    # Not fatal, but you asked for region alignment; this warns you early.
-    print("WARNING: DX/DZ are not multiples of 512; region-file alignment will not be preserved.")
+    print("WARNING: Overworld shift not multiple of 512; region files won't remain aligned.")
+if MOVE_NETHER and ((DX_BLOCKS // 8) % 512 != 0 or (DZ_BLOCKS // 8) % 512 != 0):
+    print("WARNING: Nether shift not multiple of 512; region files won't remain aligned in Nether.")
 
-DCHUNKS_X = DX_BLOCKS // 16
-DCHUNKS_Z = DZ_BLOCKS // 16
+# Overworld derived shift values
+dx_ow = DX_BLOCKS
+dz_ow = DZ_BLOCKS
+dchunks_ow = dx_ow // 16
+dchunks_z_ow = dz_ow // 16
+dregions_ow = dx_ow // 512
+dregions_z_ow = dz_ow // 512
 
-DREGIONS_X = DX_BLOCKS // 512
-DREGIONS_Z = DZ_BLOCKS // 512
+# Nether derived shift values (only used if MOVE_NETHER)
+dx_ne = dx_ow // 8
+dz_ne = dz_ow // 8
+dchunks_ne = dx_ne // 16
+dchunks_z_ne = dz_ne // 16
+dregions_ne = dx_ne // 512
+dregions_z_ne = dz_ne // 512
+
+
+@dataclass
+class DimSpec:
+    name: str
+    src_root: Path
+    dst_root: Path
+    dx_blocks: int
+    dz_blocks: int
 
 
 # =========================
@@ -311,15 +351,24 @@ def region_filename(rx: int, rz: int) -> str:
     return f"r.{rx}.{rz}.mca"
 
 
-def move_folder(kind: str, src_dir: Path, dst_dir: Path) -> None:
+def move_folder(kind: str,
+                src_dir: Path,
+                dst_dir: Path,
+                dx_blocks: int,
+                dz_blocks: int) -> None:
     """
     kind in {"region","entities","poi"}
     """
+    dchunks_x = dx_blocks // 16
+    dchunks_z = dz_blocks // 16
+    dregions_x = dx_blocks // 512
+    dregions_z = dz_blocks // 512
+
     print(f"\n== Moving {kind} ==")
     for rz in range(RZ_MIN, RZ_MAX + 1):
         for rx in range(RX_MIN, RX_MAX + 1):
             src_name = region_filename(rx, rz)
-            dst_name = region_filename(rx + DREGIONS_X, rz + DREGIONS_Z)
+            dst_name = region_filename(rx + dregions_x, rz + dregions_z)
 
             src_path = src_dir / src_name
             dst_path = dst_dir / dst_name
@@ -340,22 +389,22 @@ def move_folder(kind: str, src_dir: Path, dst_dir: Path) -> None:
                 # - entities: chunk NBT typically contains entity lists; may or may not have xPos/zPos.
                 # - poi: poi data, may not have xPos/zPos.
                 if kind == "region":
-                    shift_chunk_nbt(rec.nbt_file, DCHUNKS_X, DCHUNKS_Z, DX_BLOCKS, DZ_BLOCKS)
+                    shift_chunk_nbt(rec.nbt_file, dchunks_x, dchunks_z, dx_blocks, dz_blocks)
                 elif kind == "entities":
                     # shift root-level xPos/zPos if present
                     if "xPos" in rec.nbt_file:
-                        rec.nbt_file["xPos"] = nbtlib.Int(int(rec.nbt_file["xPos"]) + DCHUNKS_X)
+                        rec.nbt_file["xPos"] = nbtlib.Int(int(rec.nbt_file["xPos"]) + dchunks_x)
                     if "zPos" in rec.nbt_file:
-                        rec.nbt_file["zPos"] = nbtlib.Int(int(rec.nbt_file["zPos"]) + DCHUNKS_Z)
+                        rec.nbt_file["zPos"] = nbtlib.Int(int(rec.nbt_file["zPos"]) + dchunks_z)
 
                     # common: Entities list
                     if "Entities" in rec.nbt_file and isinstance(rec.nbt_file["Entities"], nbtlib.List):
                         for ent in rec.nbt_file["Entities"]:
                             if isinstance(ent, nbtlib.Compound):
-                                shift_entity_compound(ent, DX_BLOCKS, DZ_BLOCKS)
+                                shift_entity_compound(ent, dx_blocks, dz_blocks)
                 elif kind == "poi":
                     # POI is version-dependent; best-effort walker
-                    shift_poi_nbt_best_effort(rec.nbt_file, DX_BLOCKS, DZ_BLOCKS)
+                    shift_poi_nbt_best_effort(rec.nbt_file, dx_blocks, dz_blocks)
 
             # Keep timestamps (or refresh)
             now_ts = int(time.time())
@@ -369,41 +418,75 @@ def move_folder(kind: str, src_dir: Path, dst_dir: Path) -> None:
 
 
 def main() -> None:
-    # Overworld folders
-    src_region = SOURCE_WORLD / "region"
-    src_entities = SOURCE_WORLD / "entities"
-    src_poi = SOURCE_WORLD / "poi"
-
-    dst_region = TARGET_WORLD / "region"
-    dst_entities = TARGET_WORLD / "entities"
-    dst_poi = TARGET_WORLD / "poi"
-
     # Sanity
     if not (SOURCE_WORLD / "level.dat").exists():
         raise FileNotFoundError(f"Not a world folder (missing level.dat): {SOURCE_WORLD}")
     if not (TARGET_WORLD / "level.dat").exists():
         print(f"WARNING: target level.dat not found at {TARGET_WORLD}. If this is a server world, ensure path is correct.")
 
+    dims_to_process = []
+    if MOVE_OVERWORLD:
+        dims_to_process.append(
+            DimSpec(
+                name="overworld",
+                src_root=SOURCE_WORLD,
+                dst_root=TARGET_WORLD,
+                dx_blocks=dx_ow,
+                dz_blocks=dz_ow,
+            )
+        )
+    if MOVE_NETHER:
+        dims_to_process.append(
+            DimSpec(
+                name="nether",
+                src_root=SOURCE_WORLD / "DIM-1",
+                dst_root=TARGET_WORLD / "DIM-1",
+                dx_blocks=dx_ne,
+                dz_blocks=dz_ne,
+            )
+        )
+
+    if not dims_to_process:
+        print("Nothing to do: both MOVE_OVERWORLD and MOVE_NETHER are disabled.")
+        return
+
     print("SOURCE:", SOURCE_WORLD)
     print("TARGET:", TARGET_WORLD)
+    print(f"Dimension mode: {DIMENSION_MODE}")
     print(f"Regions: rx={RX_MIN}..{RX_MAX}, rz={RZ_MIN}..{RZ_MAX} (5x5)")
-    print(f"Shift: dx={DX_BLOCKS}, dz={DZ_BLOCKS} blocks")
-    print(f"      = drx={DREGIONS_X}, drz={DREGIONS_Z} regions")
-    print(f"      = dchunks_x={DCHUNKS_X}, dchunks_z={DCHUNKS_Z} chunks")
 
-    move_folder("region", src_region, dst_region)
+    for dim in dims_to_process:
+        dx = dim.dx_blocks
+        dz = dim.dz_blocks
+        print(f"\n[{dim.name}] source root: {dim.src_root}")
+        print(f"[{dim.name}] target root: {dim.dst_root}")
+        print(f"[{dim.name}] shift blocks: ({dx},{dz})  chunks: ({dx // 16},{dz // 16})  regions: ({dx // 512},{dz // 512})")
 
-    if COPY_ENTITIES:
-        if src_entities.exists():
-            move_folder("entities", src_entities, dst_entities)
-        else:
-            print("NOTE: source entities/ folder not found; skipping entities.")
+        src_region = dim.src_root / "region"
+        src_entities = dim.src_root / "entities"
+        src_poi = dim.src_root / "poi"
 
-    if COPY_POI:
-        if src_poi.exists():
-            move_folder("poi", src_poi, dst_poi)
-        else:
-            print("NOTE: source poi/ folder not found; skipping poi.")
+        dst_region = dim.dst_root / "region"
+        dst_entities = dim.dst_root / "entities"
+        dst_poi = dim.dst_root / "poi"
+
+        if not src_region.exists():
+            print(f"NOTE: [{dim.name}] source region/ folder not found; skipping dimension.")
+            continue
+
+        move_folder("region", src_region, dst_region, dx, dz)
+
+        if COPY_ENTITIES:
+            if src_entities.exists():
+                move_folder("entities", src_entities, dst_entities, dx, dz)
+            else:
+                print(f"NOTE: [{dim.name}] source entities/ folder not found; skipping entities.")
+
+        if COPY_POI:
+            if src_poi.exists():
+                move_folder("poi", src_poi, dst_poi, dx, dz)
+            else:
+                print(f"NOTE: [{dim.name}] source poi/ folder not found; skipping poi.")
 
     print("\nDONE.")
 
